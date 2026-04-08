@@ -15,6 +15,10 @@ This workflow receives data via a webhook in n8n and creates a client (and optio
 - **Endpoint:** `https://api.getjobber.com/api/graphql`
 - **Auth:** OAuth 2.0 Bearer Token
 - **Format:** GraphQL (POST requests with JSON body)
+- **Required Header:** `X-JOBBER-GRAPHQL-VERSION: 2025-01-13` (date-based API version)
+- **Content-Type:** `application/json` (Jobber no longer accepts form-urlencoded or multipart)
+- **Rate Limits:** 2,500 requests per 5 minutes per app/account + GraphQL query cost budget
+- **Lead Source:** Clients created via API automatically have your app name as the lead source
 
 ## Prerequisites
 
@@ -57,6 +61,7 @@ This workflow receives data via a webhook in n8n and creates a client (and optio
    - **Authentication:** `Predefined Credential Type` → `Header Auth` → select `Jobber API Token`
    - **Send Headers:** ON
      - Add header: `Content-Type` = `application/json`
+     - Add header: `X-JOBBER-GRAPHQL-VERSION` = `2025-01-13`
    - **Send Body:** ON
    - **Body Content Type:** `JSON`
    - **Specify Body:** `Using JSON`

@@ -26,6 +26,10 @@
             {
               "name": "Content-Type",
               "value": "application/json"
+            },
+            {
+              "name": "X-JOBBER-GRAPHQL-VERSION",
+              "value": "2025-01-13"
             }
           ]
         },
