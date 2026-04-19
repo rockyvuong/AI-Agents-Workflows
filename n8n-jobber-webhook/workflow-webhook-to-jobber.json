@@ -16,6 +16,60 @@
     },
     {
       "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Normalize and validate incoming webhook payload.\n// Handles: snake_case aliases, { body: {...} } wrappers, whitespace,\n// missing optional fields, and enforces that at least one name field\n// is present before we hit Jobber.\n\nconst raw = $input.first().json;\nconst src = (raw && typeof raw.body === 'object' && raw.body !== null) ? raw.body : raw;\n\nconst pick = (...keys) => {\n  for (const k of keys) {\n    const v = src[k];\n    if (v !== undefined && v !== null && String(v).trim() !== '') {\n      return String(v).trim();\n    }\n  }\n  return '';\n};\n\nconst firstName   = pick('firstName', 'first_name', 'FirstName');\nconst lastName    = pick('lastName', 'last_name', 'LastName');\nconst companyName = pick('companyName', 'company_name', 'company');\nconst email       = pick('email', 'emailAddress', 'email_address');\nconst phone       = pick('phone', 'phoneNumber', 'phone_number', 'mobile');\nconst street1     = pick('address', 'street', 'street1', 'address_line_1');\nconst city        = pick('city');\nconst province    = pick('state', 'province', 'region');\nconst postalCode  = pick('postalCode', 'postal_code', 'zip', 'zipCode');\nconst country     = pick('country') || 'AU';\n\n// Jobber requires at least one of: firstName+lastName OR companyName.\nif (!companyName && !(firstName || lastName)) {\n  return [{\n    json: {\n      __validationError: true,\n      message: 'Missing required fields: provide companyName or firstName/lastName.',\n      received: Object.keys(src),\n    },\n  }];\n}\n\n// Build ClientCreateInput, omitting empty optional fields so Jobber\n// doesn't reject on empty strings in a billingAddress, etc.\nconst input = {};\nif (firstName)   input.firstName   = firstName;\nif (lastName)    input.lastName    = lastName;\nif (companyName) input.companyName = companyName;\nif (email)       input.emails      = [{ description: 'MAIN', primary: true, address: email }];\nif (phone)       input.phones      = [{ description: 'MAIN', primary: true, number: phone }];\n\nconst address = {};\nif (street1)    address.street1    = street1;\nif (city)       address.city       = city;\nif (province)   address.province   = province;\nif (postalCode) address.postalCode = postalCode;\nif (Object.keys(address).length) {\n  address.country = country;\n  input.billingAddress = address;\n}\n\nconst query = 'mutation ClientCreate($input: ClientCreateInput!) { clientCreate(input: $input) { client { id firstName lastName companyName } userErrors { message path } } }';\n\nreturn [{\n  json: {\n    __validationError: false,\n    payload: { query, variables: { input } },\n    // Keep a copy of the normalized input for downstream nodes/logging\n    normalized: { firstName, lastName, companyName, email, phone, street1, city, province, postalCode, country },\n  },\n}];\n"
+      },
+      "id": "normalize-input",
+      "name": "Normalize & Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "is-valid",
+              "leftValue": "={{ $json.__validationError }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "check-validation",
+      "name": "Validation Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: 'validation_error', message: $json.message, receivedKeys: $json.received }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "validation-error-response",
+      "name": "Validation Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [850, 120]
+    },
+    {
+      "parameters": {
         "method": "POST",
         "url": "https://api.getjobber.com/api/graphql",
         "authentication": "predefinedCredentialType",
@@ -35,14 +89,25 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ query: 'mutation ClientCreate($input: ClientCreateInput!) { clientCreate(input: $input) { client { id firstName lastName } userErrors { message path } } }', variables: { input: { firstName: $json.firstName || '', lastName: $json.lastName || '', companyName: $json.companyName || '', emails: $json.email ? [{ description: \"MAIN\", primary: true, address: $json.email }] : [], phones: $json.phone ? [{ description: \"MAIN\", primary: true, number: $json.phone }] : [], billingAddress: { street1: $json.address || '', city: $json.city || '', province: $json.state || '', postalCode: $json.postalCode || '', country: $json.country || 'AU' } } } }) }}",
-        "options": {}
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
       },
       "id": "create-client",
       "name": "Create Jobber Client",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [500, 300],
+      "position": [850, 480],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
       "credentials": {
         "httpHeaderAuth": {
           "id": "",
@@ -52,19 +117,30 @@
     },
     {
       "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Classify the Jobber response into a single shape so the webhook\n// caller always gets structured JSON, whether the call was a success,\n// a GraphQL schema/auth error, user-input errors, or an HTTP failure.\n\nconst res = $input.first().json || {};\nconst statusCode = res.statusCode ?? 0;\nconst body = res.body ?? res; // fullResponse wraps the body; defensive fallback\n\n// HTTP-level failure (auth, rate limit, 5xx, timeout bubbled as 0).\nif (statusCode < 200 || statusCode >= 300) {\n  let category = 'http_error';\n  if (statusCode === 401 || statusCode === 403) category = 'auth_error';\n  else if (statusCode === 429) category = 'rate_limited';\n  else if (statusCode >= 500) category = 'upstream_error';\n  else if (statusCode === 0) category = 'network_error';\n\n  return [{\n    json: {\n      success: false,\n      error: category,\n      statusCode,\n      message: category === 'auth_error'\n        ? 'Jobber rejected the request. Check that the access token is valid and not expired.'\n        : `Jobber returned HTTP ${statusCode}.`,\n      details: body,\n      responseCode: statusCode === 429 ? 503 : (statusCode >= 500 ? 502 : 502),\n    },\n  }];\n}\n\n// Top-level GraphQL errors (malformed query, schema mismatch, etc.).\nif (Array.isArray(body.errors) && body.errors.length) {\n  return [{\n    json: {\n      success: false,\n      error: 'graphql_error',\n      message: 'Jobber GraphQL returned errors.',\n      details: body.errors,\n      responseCode: 502,\n    },\n  }];\n}\n\nconst result = body?.data?.clientCreate;\nif (!result) {\n  return [{\n    json: {\n      success: false,\n      error: 'unexpected_response',\n      message: 'Jobber response did not include data.clientCreate.',\n      details: body,\n      responseCode: 502,\n    },\n  }];\n}\n\n// Input-level errors reported by Jobber (bad email format, missing field, ...).\nif (Array.isArray(result.userErrors) && result.userErrors.length) {\n  return [{\n    json: {\n      success: false,\n      error: 'user_error',\n      message: 'Jobber rejected the client input.',\n      userErrors: result.userErrors,\n      responseCode: 400,\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    success: true,\n    clientId: result.client?.id,\n    client: result.client,\n    responseCode: 200,\n  },\n}];\n"
+      },
+      "id": "classify-response",
+      "name": "Classify Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 480]
+    },
+    {
+      "parameters": {
         "conditions": {
           "options": {
             "caseSensitive": true,
             "leftValue": "",
-            "typeValidation": "strict"
+            "typeValidation": "loose"
           },
           "conditions": [
             {
-              "id": "check-errors",
-              "leftValue": "={{ $json.data.clientCreate.userErrors.length }}",
-              "rightValue": 0,
+              "id": "is-success",
+              "leftValue": "={{ $json.success }}",
+              "rightValue": true,
               "operator": {
-                "type": "number",
+                "type": "boolean",
                 "operation": "equals"
               }
             }
@@ -73,42 +149,71 @@
         },
         "options": {}
       },
-      "id": "check-errors",
-      "name": "Check for Errors",
+      "id": "check-success",
+      "name": "Succeeded?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [750, 300]
+      "position": [1250, 480]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ success: true, clientId: $('Create Jobber Client').item.json.data.clientCreate.client.id, message: 'Client created successfully' }) }}",
+        "responseBody": "={{ JSON.stringify({ success: true, clientId: $json.clientId, client: $json.client, message: 'Client created successfully' }) }}",
         "options": {}
       },
       "id": "success-response",
       "name": "Success Response",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1000, 200]
+      "position": [1450, 380]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ success: false, errors: $('Create Jobber Client').item.json.data.clientCreate.userErrors, message: 'Failed to create client' }) }}",
+        "responseBody": "={{ JSON.stringify({ success: false, error: $json.error, message: $json.message, statusCode: $json.statusCode, userErrors: $json.userErrors, details: $json.details }) }}",
         "options": {
-          "responseCode": 400
+          "responseCode": "={{ $json.responseCode || 400 }}"
         }
       },
       "id": "error-response",
       "name": "Error Response",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1000, 400]
+      "position": [1450, 580]
     }
   ],
   "connections": {
     "Webhook": {
       "main": [
+        [
+          {
+            "node": "Normalize & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Validate": {
+      "main": [
+        [
+          {
+            "node": "Validation Failed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validation Failed?": {
+      "main": [
+        [
+          {
+            "node": "Validation Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Create Jobber Client",
@@ -122,14 +227,25 @@
       "main": [
         [
           {
-            "node": "Check for Errors",
+            "node": "Classify Response",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Check for Errors": {
+    "Classify Response": {
+      "main": [
+        [
+          {
+            "node": "Succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Succeeded?": {
       "main": [
         [
           {

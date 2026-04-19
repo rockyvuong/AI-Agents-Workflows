@@ -124,10 +124,23 @@ After the client is created, you can chain another HTTP Request node to create a
 
 ### Step 5: Add Error Handling
 
-1. Add an **If** node after each HTTP Request to check for errors:
-   - Condition: `{{ $json.data.clientCreate.userErrors.length }}` **greater than** `0`
-   - True branch: Send error notification (email/Slack)
-   - False branch: Continue to next step
+The importable workflow (`workflow-webhook-to-jobber.json`) already includes
+robust error handling. If you're building the workflow by hand, the key
+rules (learned from real failures — see the "Failure Modes" section below)
+are:
+
+1. **Never let the HTTP node throw.** Set, under the HTTP Request node's
+   **Options**:
+   - `Response → Response → Never Error` = ON
+   - `Response → Response → Full Response` = ON (so you can read `statusCode`)
+   - `Timeout` = `30000` ms
+   - `Retry On Fail` = ON, `Max Tries` = 3, `Wait Between Tries` = 2000 ms
+2. **Classify the response in a Code node**, not an IF node, because
+   `$json.data.clientCreate.userErrors.length` throws when `data` is
+   undefined (which happens on auth errors, rate limits, and schema
+   errors — Jobber returns `{"errors":[…]}` with no `data`).
+3. Branch after the classifier: a boolean `success` flag routed to
+   **Success Response** / **Error Response** `respondToWebhook` nodes.
 
 ### Step 6: Activate the Workflow
 
@@ -245,6 +258,39 @@ query {
   }
 }
 ```
+
+---
+
+## Failure Modes & Prevention
+
+The first version of this workflow had several ways to hard-fail an
+execution (making it appear as a red "failed" run in n8n instead of
+returning a structured error to the caller). The current workflow
+guards against each of these:
+
+| # | Failure | Symptom | Guard |
+|---|---------|---------|-------|
+| 1 | Expired Jobber token (HTTP 401) | Node throws "401 Unauthorized" and the whole execution is marked failed; webhook caller gets no JSON | `neverError: true` on HTTP node + response classifier returns `error: "auth_error"` with HTTP 502 |
+| 2 | Rate limit (HTTP 429) | Execution fails on a busy hour | `neverError: true` + node retry (3 tries, 2 s backoff) + classifier returns `rate_limited` |
+| 3 | Upstream 5xx / network timeout | Execution fails with a stack trace | `timeout: 30000`, node retry, `neverError` |
+| 4 | GraphQL top-level `errors` (no `data`) | IF node throws `Cannot read properties of undefined (reading 'clientCreate')` | Classifier Code node checks `body.errors` before touching `body.data` |
+| 5 | Missing required name fields | Empty `firstName`/`lastName`/`companyName` reach Jobber and come back as `userErrors` | Normalize & Validate Code node rejects the request with HTTP 400 before the API call |
+| 6 | Payload shape drift (`first_name` vs `firstName`, `{body: {...}}` wrapper) | Fields silently empty | Normalize node accepts snake_case/camelCase aliases and unwraps `body` |
+| 7 | Empty `billingAddress`/`emails`/`phones` sent as empty strings/arrays | Occasional Jobber `userErrors` | Normalize node omits empty optional fields entirely |
+| 8 | Malformed JSON body from a stringified template | Silent bad-request loops | Body is built as a structured object in the Code node and stringified once at the HTTP node boundary |
+
+### Monitoring recommendations
+
+- In n8n **Settings → Log streaming** (or **Error Workflow**), wire a
+  catch-all error workflow that posts to Slack/email when a run still
+  somehow fails. With the guards above, this should be rare — useful as
+  a canary.
+- Set the workflow's **Settings → Error Workflow** to a dedicated
+  workflow so unexpected crashes surface quickly instead of piling up
+  silently in the Executions tab.
+- If you aren't using OAuth2 (Option B under "Handling Token Refresh"),
+  build a scheduled token-refresh workflow — cause #1 above will come
+  back every 60 minutes without it.
 
 ---
 
